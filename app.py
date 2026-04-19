@@ -2,6 +2,7 @@ import os
 import torch
 import threading
 import tempfile
+import numpy as np
 import gradio as gr
 from huggingface_hub import login
 from cached_path import cached_path
@@ -35,18 +36,14 @@ def load_vivoice_model(device):
     )
     return model.to(device)
 
-models = []
-vocoders = []
-devices = []
+models, vocoders, devices = [], [], []
 
-# Nạp model vào danh sách ứng với từng GPU
 for i in range(min(device_count, 2)):
     dev = f"cuda:{i}"
     models.append(load_vivoice_model(dev))
     vocoders.append(load_vocoder().to(dev))
     devices.append(dev)
 
-# Dự phòng nếu không có GPU
 if not models:
     dev = "cpu"
     models.append(load_vivoice_model(dev))
@@ -79,24 +76,24 @@ def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0, request: g
     selected_vocoder = vocoders[worker_id]
     selected_device = devices[worker_id]
     
-    print(f"🎙️ Worker {worker_id} đang xử lý trên {selected_device}")
-
     try:
-        # QUAN TRỌNG: Ép toàn bộ tiến trình này phải chạy trên GPU đã chọn
-        # Điều này sửa lỗi "Expected all tensors to be on the same device"
         with torch.cuda.device(selected_device):
             ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, "")
             
-            # Chuẩn hóa văn bản
+            # CHUẨN HÓA VĂN BẢN
             norm_text = post_process(TTSnorm(gen_text)).lower()
             
+            # --- CHỐT CHẶN LỖI: KIỂM TRA TEXT SAU KHI NORM ---
+            if not norm_text.strip() or len(norm_text) < 1:
+                print(f"⚠️ Cảnh báo: Text trống sau khi norm trên {selected_device}. Trả về im lặng.")
+                # Trả về 0.5 giây im lặng thay vì báo lỗi crash
+                silence_wave = np.zeros(int(44100 * 0.5), dtype=np.float32)
+                return (44100, silence_wave), None
+            # -----------------------------------------------
+            
             final_wave, final_sample_rate, spectrogram = infer_process(
-                ref_audio, 
-                ref_text.lower(), 
-                norm_text, 
-                selected_model, 
-                selected_vocoder, 
-                speed=speed
+                ref_audio, ref_text.lower(), norm_text, 
+                selected_model, selected_vocoder, speed=speed
             )
             
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_spectrogram:
@@ -111,7 +108,7 @@ def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0, request: g
 
 # 4. Giao diện Gradio
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown(f"# 🎤 F5-TTS Dual-GPU (Fixed)\nHệ thống đang dùng **{len(models)} GPU** để xử lý song song.")
+    gr.Markdown(f"# 🎤 F5-TTS Dual-GPU Pro (Fix Tensor Error)\nĐang dùng **{len(models)} GPU** xử lý song song.")
     
     with gr.Row():
         ref_audio = gr.Audio(label="🔊 Giọng mẫu", type="filepath")
@@ -128,8 +125,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         fn=infer_tts, 
         inputs=[ref_audio, gen_text, speed], 
         outputs=[output_audio, output_spectrogram],
-        concurrency_limit=len(models) # Xử lý song song tối đa bằng số GPU
+        concurrency_limit=len(models)
     )
 
-# Launch với hàng đợi tối ưu
 demo.queue(default_concurrency_limit=len(models)).launch(share=True)
