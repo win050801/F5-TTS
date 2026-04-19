@@ -21,11 +21,10 @@ hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 if hf_token:
     login(token=hf_token)
 
-# Kiểm tra GPU
 device_count = torch.cuda.device_count()
-print(f"🚀 Hệ thống phát hiện {device_count} GPU.")
+print(f"🚀 Phát hiện {device_count} GPU. Đang khởi tạo...")
 
-# 2. Tải Model lên cả 2 GPU
+# 2. Tải Model lên 2 GPU độc lập
 def load_vivoice_model(device):
     print(f"📦 Đang nạp Model lên {device}...")
     model = load_model(
@@ -36,48 +35,42 @@ def load_vivoice_model(device):
     )
     return model.to(device)
 
-# Khởi tạo 2 bộ công cụ trên 2 GPU
 models = []
 vocoders = []
 devices = []
 
-if device_count >= 2:
-    # Nạp cho GPU 0
-    models.append(load_vivoice_model("cuda:0"))
-    vocoders.append(load_vocoder().to("cuda:0"))
-    devices.append("cuda:0")
-    # Nạp cho GPU 1
-    models.append(load_vivoice_model("cuda:1"))
-    vocoders.append(load_vocoder().to("cuda:1"))
-    devices.append("cuda:1")
-else:
-    # Nếu chỉ có 1 GPU hoặc CPU
-    dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+# Nạp model vào danh sách ứng với từng GPU
+for i in range(min(device_count, 2)):
+    dev = f"cuda:{i}"
     models.append(load_vivoice_model(dev))
     vocoders.append(load_vocoder().to(dev))
     devices.append(dev)
 
-# 3. Bộ điều phối yêu cầu (Load Balancer)
+# Dự phòng nếu không có GPU
+if not models:
+    dev = "cpu"
+    models.append(load_vivoice_model(dev))
+    vocoders.append(load_vocoder().to(dev))
+    devices.append(dev)
+
+# 3. Điều phối luồng và GPU
 gpu_counter = 0
 gpu_lock = threading.Lock()
 
 def post_process(text):
     text = " " + text + " "
-    text = text.replace(" . . ", " . ")
-    text = text.replace(" .. ", " . ")
-    text = text.replace(" , , ", " , ")
-    text = text.replace(" ,, ", " , ")
+    text = text.replace(" . . ", " . ").replace(" .. ", " . ")
+    text = text.replace(" , , ", " , ").replace(" ,, ", " , ")
     text = text.replace('"', "")
     return " ".join(text.split())
 
-# Hàm xử lý chính (Không dùng @spaces.GPU)
-def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0):
+def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0, request: gr.Request = None):
     global gpu_counter
     
     if not ref_audio_orig or not gen_text.strip():
         raise gr.Error("Vui lòng cung cấp đủ giọng mẫu và văn bản.")
 
-    # Chọn GPU luân phiên
+    # Chọn worker (GPU) theo kiểu xoay vòng
     with gpu_lock:
         worker_id = gpu_counter % len(models)
         gpu_counter += 1
@@ -86,55 +79,57 @@ def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0):
     selected_vocoder = vocoders[worker_id]
     selected_device = devices[worker_id]
     
-    print(f"🎙️ Đang xử lý trên {selected_device} (Yêu cầu số {gpu_counter})")
+    print(f"🎙️ Worker {worker_id} đang xử lý trên {selected_device}")
 
     try:
-        # Tiền xử lý
-        ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, "")
-        
-        # Chạy Inference trên GPU đã chọn
-        final_wave, final_sample_rate, spectrogram = infer_process(
-            ref_audio, 
-            ref_text.lower(), 
-            post_process(TTSnorm(gen_text)).lower(), 
-            selected_model, 
-            selected_vocoder, 
-            speed=speed
-        )
-        
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_spectrogram:
-            spectrogram_path = tmp_spectrogram.name
-            save_spectrogram(spectrogram, spectrogram_path)
+        # QUAN TRỌNG: Ép toàn bộ tiến trình này phải chạy trên GPU đã chọn
+        # Điều này sửa lỗi "Expected all tensors to be on the same device"
+        with torch.cuda.device(selected_device):
+            ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, "")
+            
+            # Chuẩn hóa văn bản
+            norm_text = post_process(TTSnorm(gen_text)).lower()
+            
+            final_wave, final_sample_rate, spectrogram = infer_process(
+                ref_audio, 
+                ref_text.lower(), 
+                norm_text, 
+                selected_model, 
+                selected_vocoder, 
+                speed=speed
+            )
+            
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_spectrogram:
+                spectrogram_path = tmp_spectrogram.name
+                save_spectrogram(spectrogram, spectrogram_path)
 
-        return (final_sample_rate, final_wave), spectrogram_path
+            return (final_sample_rate, final_wave), spectrogram_path
+            
     except Exception as e:
-        print(f"❌ Lỗi trên {selected_device}: {e}")
+        print(f"❌ Lỗi thực thi trên {selected_device}: {e}")
         raise gr.Error(f"Lỗi tạo giọng nói: {e}")
 
 # 4. Giao diện Gradio
-with gr.Blocks(theme=gr.themes.Soft(), title="F5-TTS 2-GPU Pro") as demo:
-    gr.Markdown("# 🎤 F5-TTS Vietnamese: Chế độ 2-GPU Ultra Speed")
-    gr.Markdown(f"Hệ thống đang chạy trên **{len(models)} GPU** để tối ưu hóa hàng đợi.")
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown(f"# 🎤 F5-TTS Dual-GPU (Fixed)\nHệ thống đang dùng **{len(models)} GPU** để xử lý song song.")
     
     with gr.Row():
         ref_audio = gr.Audio(label="🔊 Giọng mẫu", type="filepath")
-        gen_text = gr.Textbox(label="📝 Văn bản", placeholder="Nhập nội dung...", lines=3)
+        gen_text = gr.Textbox(label="📝 Văn bản", lines=3)
     
     speed = gr.Slider(0.3, 2.0, value=1.0, step=0.1, label="⚡ Tốc độ")
-    btn_synthesize = gr.Button("🔥 BẮT ĐẦU TẠO GIỌNG", variant="primary")
+    btn_synthesize = gr.Button("🔥 Tạo giọng nói", variant="primary")
     
     with gr.Row():
         output_audio = gr.Audio(label="🎧 Kết quả", type="numpy")
         output_spectrogram = gr.Image(label="📊 Biểu đồ phổ")
 
-    # Thiết lập xử lý song song cho nút bấm
     btn_synthesize.click(
         fn=infer_tts, 
         inputs=[ref_audio, gen_text, speed], 
         outputs=[output_audio, output_spectrogram],
-        concurrency_limit=len(models) # Giới hạn số câu xử lý cùng lúc bằng số GPU
+        concurrency_limit=len(models) # Xử lý song song tối đa bằng số GPU
     )
 
-# 5. Cấu hình Hàng đợi và Launch
-# max_size=20 để khớp với yêu cầu 20 luồng của bạn
+# Launch với hàng đợi tối ưu
 demo.queue(default_concurrency_limit=len(models)).launch(share=True)
