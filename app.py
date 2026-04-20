@@ -49,13 +49,24 @@ gpu_counter = 0
 gpu_lock = threading.Lock()
 
 def post_process(text):
-    # Chuẩn hóa khoảng trắng và dấu câu
     text = text.replace(" . . ", " . ").replace(" .. ", " . ").replace('"', "")
     return " ".join(text.split())
 
 def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0, request: gr.Request = None):
     global gpu_counter
     
+    # 1. Chuẩn hóa văn bản trước
+    norm_text = post_process(TTSnorm(gen_text)).lower()
+    word_count = len(norm_text.split())
+
+    # --- THUẬT TOÁN TRẢ VỀ KHOẢNG LẶNG CHO CÂU NGẮN (ĐÃ SỬA) ---
+    if word_count <= 3:
+        print(f"⚠️ Câu quá ngắn ({word_count} từ), trả về khoảng lặng để tránh lỗi AI.")
+        # Tính toán thời gian im lặng: 1 từ tương đương ~0.5s, tối đa 1.5s
+        silence_sec = 0.5 if word_count == 0 else word_count * 0.5
+        return (44100, np.zeros(int(44100 * silence_sec), dtype=np.float32)), None
+
+    # 2. Điều phối GPU cho các câu bình thường
     with gpu_lock:
         worker_id = gpu_counter % len(models)
         gpu_counter += 1
@@ -64,24 +75,10 @@ def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0, request: g
     selected_vocoder = vocoders[worker_id]
     selected_device = devices[worker_id]
     
-    # Chuẩn hóa văn bản tiếng Việt
-    norm_text = post_process(TTSnorm(gen_text)).lower()
-
-    # --- THUẬT TOÁN CHÈN KHOẢNG TRẮNG CHO CÂU NGẮN ---
-    word_count = len(norm_text.split())
-    if word_count > 0 and word_count <= 3:
-        # Thêm dấu chấm và khoảng trắng mồi để AI không lỗi tensor
-        norm_text = norm_text + " . . . . ."
-        print(f"⚠️ Câu ngắn ({word_count} từ), đã chèn thêm khoảng trắng mồi.")
-
     try:
-        if not norm_text.strip():
-            raise ValueError("Văn bản trống.")
-
         with torch.cuda.device(selected_device):
             ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, "")
             
-            # Thực hiện tạo giọng nói clone
             final_wave, final_sample_rate, spectrogram = infer_process(
                 ref_audio, 
                 ref_text.lower(), 
@@ -91,11 +88,11 @@ def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0, request: g
                 speed=speed
             )
             
-            # Giới hạn ảo giác: Nếu AI nói quá 30s cho một câu ngắn
+            # Giới hạn ảo giác âm thanh
             actual_sec = len(final_wave) / final_sample_rate
             if actual_sec > 25 and word_count < 10:
                 print(f"⚠️ Phát hiện ảo giác ({actual_sec:.1f}s), tự động cắt bỏ.")
-                final_wave = final_wave[:int(final_sample_rate * 5)] # Cắt lấy 5s đầu
+                final_wave = final_wave[:int(final_sample_rate * 5)]
 
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
                 save_spectrogram(spectrogram, tmp_img.name)
@@ -104,14 +101,13 @@ def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0, request: g
 
     except Exception as e:
         print(f"❌ Lỗi thực thi trên {selected_device}: {e}")
-        # TRẢ VỀ IM LẶNG: Giữ đúng timecode cho phim review
-        silence_sec = 0.5 if word_count == 0 else min(word_count * 0.5, 2.0)
-        return (44100, np.zeros(int(44100 * silence_sec), dtype=np.float32)), None
+        # Fallback im lặng nếu có lỗi bất ngờ
+        return (44100, np.zeros(int(44100 * 1.0), dtype=np.float32)), None
 
 # --- 4. GIAO DIỆN ---
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🎤 Nhím Review - F5-TTS Pure Engine (No Edge)")
-    gr.Markdown(f"Server chạy trên **{len(models)} GPU**. Tự động chèn khoảng trắng cho câu ngắn.")
+    gr.Markdown("# 🎤 Nhím Review - F5-TTS Pure Engine")
+    gr.Markdown(f"Chế độ: **Tự động trả khoảng lặng cho câu dưới 3 từ** để tránh lỗi voice.")
     
     with gr.Row():
         ref_audio = gr.Audio(label="Giọng mẫu", type="filepath")
@@ -126,5 +122,4 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
     btn.click(infer_tts, [ref_audio, gen_text, speed], [out_aud, out_img])
 
-# Launch với hàng đợi xử lý 20 luồng
 demo.queue(max_size=50).launch(share=True, max_threads=20)
