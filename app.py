@@ -1,125 +1,132 @@
 import os
-import torch
-import threading
-import tempfile
-import numpy as np
+import pysrt
+import time
 import gradio as gr
-import uuid
-from huggingface_hub import login
-from cached_path import cached_path
-from vinorm import TTSnorm
+from pydub import AudioSegment, effects
+from gradio_client import Client, handle_file
+import concurrent.futures
 
-from f5_tts.model import DiT
-from f5_tts.infer.utils_infer import (
-    preprocess_ref_audio_text,
-    load_vocoder,
-    load_model,
-    infer_process,
-    save_spectrogram,
-)
+def time_to_ms(srt_time):
+    return (srt_time.hours * 3600000 + srt_time.minutes * 60000 + 
+            srt_time.seconds * 1000 + srt_time.milliseconds)
 
-# --- 1. CẤU HÌNH HỆ THỐNG ---
-hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
-if hf_token:
-    login(token=hf_token)
-
-device_count = torch.cuda.device_count()
-print(f"🚀 Nhím Review Engine: Chế độ thuần F5-TTS trên {device_count} GPU.")
-
-# --- 2. NẠP MODEL LÊN 2 GPU ---
-def load_vivoice_model(device):
-    print(f"📦 Đang nạp F5-TTS lên {device}...")
-    model = load_model(
-        DiT,
-        dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4),
-        ckpt_path=str(cached_path("hf://hynt/F5-TTS-Vietnamese-ViVoice/model_last.pt")),
-        vocab_file=str(cached_path("hf://hynt/F5-TTS-Vietnamese-ViVoice/config.json")),
-    )
-    return model.to(device)
-
-models, vocoders, devices = [], [], []
-for i in range(min(device_count, 2)):
-    dev = f"cuda:{i}"
-    models.append(load_vivoice_model(dev))
-    vocoders.append(load_vocoder().to(dev))
-    devices.append(dev)
-
-# --- 3. ĐIỀU PHỐI VÀ XỬ LÝ ---
-gpu_counter = 0
-gpu_lock = threading.Lock()
-
-def post_process(text):
-    text = text.replace(" . . ", " . ").replace(" .. ", " . ").replace('"', "")
-    return " ".join(text.split())
-
-def infer_tts(ref_audio_orig: str, gen_text: str, speed: float = 1.0, request: gr.Request = None):
-    global gpu_counter
-    
-    # 1. Chuẩn hóa văn bản trước
-    norm_text = post_process(TTSnorm(gen_text)).lower()
-    word_count = len(norm_text.split())
-
-    # --- THUẬT TOÁN TRẢ VỀ KHOẢNG LẶNG CHO CÂU NGẮN (ĐÃ SỬA) ---
-    if word_count <= 3:
-        print(f"⚠️ Câu quá ngắn ({word_count} từ), trả về khoảng lặng để tránh lỗi AI.")
-        # Tính toán thời gian im lặng: 1 từ tương đương ~0.5s, tối đa 1.5s
-        silence_sec = 0.5 if word_count == 0 else word_count * 0.5
-        return (44100, np.zeros(int(44100 * silence_sec), dtype=np.float32)), None
-
-    # 2. Điều phối GPU cho các câu bình thường
-    with gpu_lock:
-        worker_id = gpu_counter % len(models)
-        gpu_counter += 1
-    
-    selected_model = models[worker_id]
-    selected_vocoder = vocoders[worker_id]
-    selected_device = devices[worker_id]
-    
+def get_tts_audio(client, text, ref_audio, speed, index):
+    """Hàm phụ trợ gọi API cho từng câu đơn lẻ"""
+    if not text.strip(): return None
+    proc_text = text if len(text.split()) > 3 else text + " . . ."
     try:
-        with torch.cuda.device(selected_device):
-            ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, "")
-            
-            final_wave, final_sample_rate, spectrogram = infer_process(
-                ref_audio, 
-                ref_text.lower(), 
-                norm_text, 
-                selected_model, 
-                selected_vocoder, 
-                speed=speed
-            )
-            
-            # Giới hạn ảo giác âm thanh
-            actual_sec = len(final_wave) / final_sample_rate
-            if actual_sec > 25 and word_count < 10:
-                print(f"⚠️ Phát hiện ảo giác ({actual_sec:.1f}s), tự động cắt bỏ.")
-                final_wave = final_wave[:int(final_sample_rate * 5)]
+        result = client.predict(
+            ref_audio_orig=handle_file(ref_audio),
+            gen_text=proc_text,
+            speed=speed,
+            api_name="/infer_tts"
+        )
+        gen_path = result[0] if isinstance(result, (list, tuple)) else result
+        return AudioSegment.from_file(gen_path)
+    except Exception as e:
+        print(f"⚠️ Lỗi câu {index}: {e}")
+        return None
 
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
-                save_spectrogram(spectrogram, tmp_img.name)
-                
-            return (final_sample_rate, final_wave), tmp_img.name
+def process_batch_pair(index_pair, pair_subs, api_link, ref_audio, speed):
+    """
+    Xử lý một cặp câu (2 câu) cùng lúc.
+    Tính toán khoảng lặng chính xác giữa 2 câu.
+    """
+    client = Client(api_link)
+    combined_audio = AudioSegment.empty()
+    
+    # Lấy câu 1
+    sub1 = pair_subs[0]
+    audio1 = get_tts_audio(client, sub1.text, ref_audio, speed, f"{index_pair}a")
+    
+    if len(pair_subs) > 1:
+        # Lấy câu 2
+        sub2 = pair_subs[1]
+        audio2 = get_tts_audio(client, sub2.text, ref_audio, speed, f"{index_pair}b")
+        
+        # Tính toán Gap giữa câu 1 và câu 2
+        gap_ms = time_to_ms(sub2.start) - time_to_ms(sub1.end)
+        if gap_ms < 0: gap_ms = 0
+        
+        # Ghép nối: Audio1 + Im lặng (Gap) + Audio2
+        silence = AudioSegment.silent(duration=gap_ms)
+        
+        # Fallback nếu audio lỗi
+        a1 = audio1 if audio1 else AudioSegment.silent(duration=(time_to_ms(sub1.end)-time_to_ms(sub1.start)))
+        a2 = audio2 if audio2 else AudioSegment.silent(duration=(time_to_ms(sub2.end)-time_to_ms(sub2.start)))
+        
+        combined_audio = a1 + silence + a2
+    else:
+        # Trường hợp câu lẻ cuối cùng
+        combined_audio = audio1 if audio1 else AudioSegment.silent(duration=(time_to_ms(sub1.end)-time_to_ms(sub1.start)))
+
+    # Trả về start_time của câu đầu tiên trong cặp để overlay chính xác
+    return time_to_ms(sub1.start), combined_audio
+
+def run_dubbing_max_gpu(api_link, ref_audio, srt_file, global_speed):
+    try:
+        subs = pysrt.open(srt_file.name, encoding='utf-8')
+        # Gom các câu thành từng cặp [(sub1, sub2), (sub3, sub4), ...]
+        pairs = [subs[i:i+2] for i in range(0, len(subs), 2)]
+        total_pairs = len(pairs)
+        results = []
+
+        # TĂNG CỬA SỔ LÊN 10-15 ĐỂ ÉP GPU
+        max_window = 10 
+        
+        print(f"🔥 Đang chạy {total_pairs} cặp câu với {max_window} luồng song song...")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_window) as executor:
+            futures = {}
+            current_idx = 0
+
+            # Gửi các cặp câu đầu tiên
+            while current_idx < min(max_window, total_pairs):
+                f = executor.submit(process_batch_pair, current_idx, pairs[current_idx], api_link, ref_audio, global_speed)
+                futures[f] = current_idx
+                current_idx += 1
+
+            while futures:
+                done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                for f in done:
+                    start_ms, audio_seg = f.result()
+                    results.append((start_ms, audio_seg))
+                    
+                    del futures[f]
+                    if current_idx < total_pairs:
+                        new_f = executor.submit(process_batch_pair, current_idx, pairs[current_idx], api_link, ref_audio, global_speed)
+                        futures[new_f] = current_idx
+                        current_idx += 1
+                    print(f"✅ Đã xong cặp {len(results)}/{total_pairs}")
+
+        # Tổng hợp file
+        print("🎵 Đang xuất file...")
+        last_end_ms = time_to_ms(subs[-1].end) + 2000
+        final_audio = AudioSegment.silent(duration=last_end_ms)
+        
+        for start_pos, seg in results:
+            final_audio = final_audio.overlay(seg, position=start_pos)
+
+        out_name = "nhim_review_max_gpu.wav"
+        final_audio.export(out_name, format="wav")
+        return "✅ Đã vắt kiệt GPU! File đã sẵn sàng.", out_name
 
     except Exception as e:
-        print(f"❌ Lỗi thực thi trên {selected_device}: {e}")
-        # Fallback im lặng nếu có lỗi bất ngờ
-        return (44100, np.zeros(int(44100 * 1.0), dtype=np.float32)), None
+        return f"❌ Lỗi: {str(e)}", None
 
-# --- 4. GIAO DIỆN ---
-with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🎤 Nhím Review - F5-TTS Pure Engine")
-    gr.Markdown(f"Chế độ: **Tự động trả khoảng lặng cho câu dưới 3 từ** để tránh lỗi voice.")
-    
+# --- Gradio UI ---
+with gr.Blocks(theme=gr.themes.Monochrome()) as demo:
+    gr.Markdown("# 🚀 F5-TTS GPU BATCHER (Gom cặp + Gap chính xác)")
     with gr.Row():
-        ref_audio = gr.Audio(label="Giọng mẫu", type="filepath")
-        gen_text = gr.Textbox(label="Văn bản", lines=3)
-    
-    speed = gr.Slider(0.3, 2.0, value=1.0, step=0.1, label="Tốc độ")
-    btn = gr.Button("🚀 TẠO GIỌNG CLONE", variant="primary")
-    
-    with gr.Row():
-        out_aud = gr.Audio(label="Kết quả", type="numpy")
-        out_img = gr.Image(label="Spectrogram")
+        with gr.Column():
+            url = gr.Textbox(label="API URL")
+            ref = gr.Audio(label="Giọng mẫu", type="filepath")
+            srt = gr.File(label="File SRT")
+            spd = gr.Slider(0.5, 2.0, 1.0, step=0.1, label="Speed")
+            btn = gr.Button("🔥 CHẠY ÉP XUNG GPU", variant="primary")
+        with gr.Column():
+            status = gr.Textbox(label="Status")
+            out = gr.Audio(label="Kết quả")
+    btn.click(run_dubbing_max_gpu, [url, ref, srt, spd], [status, out])
 
-    btn.click(infer_tts, [ref_audio, gen_text, speed], [out_aud, out_img])
-
-demo.queue(max_size=50).launch(share=True, max_threads=20)
+demo.launch()
